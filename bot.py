@@ -166,6 +166,34 @@ async def check_subscriptions(user_id):
             continue
     return not_subscribed
 
+
+def _is_private(obj) -> bool:
+    """Return True if the update (message or callback) comes from a private chat."""
+    try:
+        # Normalize getting chat from Message or CallbackQuery
+        chat = None
+        if hasattr(obj, "chat") and getattr(obj, "chat") is not None:
+            chat = getattr(obj, "chat")
+        elif hasattr(obj, "message") and getattr(obj, "message") is not None:
+            chat = getattr(obj.message, "chat", None)
+
+        if chat is None:
+            return False
+
+        ctype = getattr(chat, "type", None)
+        # Accept enum or string values; compare robustly to 'private'
+        if isinstance(ctype, str):
+            return ctype.lower() == "private"
+        # For enum-like objects, try value attribute or direct comparison
+        if getattr(ctype, "value", None) == "private":
+            return True
+        try:
+            return ctype == types.ChatType.PRIVATE
+        except Exception:
+            return False
+    except Exception:
+        return False
+
 async def build_join_button(channel_id: str, request_required: bool = False) -> InlineKeyboardButton | None:
     """
     Build a join button that works for both @username channels and numeric -100 IDs.
@@ -173,30 +201,18 @@ async def build_join_button(channel_id: str, request_required: bool = False) -> 
     """
     channel_id = channel_id.strip()
     url = None
+    # Do not use or show admin-supplied stored links.
+    # For request_required channels try to create a join-request invite link (bot must be admin).
     if request_required:
-        # Use admin-supplied join-request link if available (most reliable for private/zayavka kanallar)
-        stored = db_query(
-            "SELECT invite_link FROM channels WHERE channel_id = ?",
-            (channel_id,),
-            fetchone=True
-        )
-        if stored and stored[0]:
-            url = stored[0]
-        else:
-            # If admin link yo'q, try to create fresh join-request link (requires bot to be admin with invite rights)
-            try:
-                invite = await bot.create_chat_invite_link(
-                    chat_id=channel_id,
-                    creates_join_request=True
-                )
-                url = invite.invite_link
-                db_query(
-                    "UPDATE channels SET invite_link = ? WHERE channel_id = ?",
-                    (url, channel_id)
-                )
-            except Exception as exc:
-                logger.warning("Join-request invite generation failed for %s: %s", channel_id, exc)
-                return None
+        try:
+            invite = await bot.create_chat_invite_link(
+                chat_id=channel_id,
+                creates_join_request=True
+            )
+            url = invite.invite_link
+        except Exception as exc:
+            logger.warning("Join-request invite generation failed for %s: %s", channel_id, exc)
+            return None
     else:
         if channel_id.startswith("@"):
             url = f"https://t.me/{channel_id[1:]}"
@@ -255,6 +271,8 @@ async def on_chat_join_request(request: ChatJoinRequest) -> None:
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
+    if not _is_private(message):
+        return
     db_query("INSERT OR IGNORE INTO users (user_id, username, joined_date) VALUES (?, ?, ?)", 
              (message.from_user.id, message.from_user.username, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     
@@ -283,6 +301,8 @@ async def start_cmd(message: types.Message):
 
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_cb(callback: CallbackQuery):
+    if not _is_private(callback):
+        return
     not_subscribed = await check_subscriptions(callback.from_user.id)
     if not not_subscribed:
         await callback.message.edit_text(
@@ -306,6 +326,8 @@ async def send_movie(message, code):
 
 @dp.message(F.text.isdigit())
 async def handle_movie_code(message: types.Message):
+    if not _is_private(message):
+        return
     not_subscribed = await check_subscriptions(message.from_user.id)
     if not_subscribed:
         await start_cmd(message)
@@ -316,6 +338,8 @@ async def handle_movie_code(message: types.Message):
 
 @dp.message(Command("admin"))
 async def admin_cmd(message: types.Message):
+    if not _is_private(message):
+        return
     if not is_admin(message.from_user.id): return
     
     builder = InlineKeyboardBuilder()
@@ -333,21 +357,62 @@ async def admin_cmd(message: types.Message):
 
 @dp.callback_query(F.data == "adm_stats")
 async def adm_stats_cb(callback: CallbackQuery):
-    u_count = db_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
+    if not _is_private(callback):
+        return
+    # Basic counts
+    users = [row[0] for row in db_query("SELECT user_id FROM users", fetchall=True) or []]
     a_count = db_query("SELECT COUNT(*) FROM admins", fetchone=True)[0]
-    c_count = db_query("SELECT COUNT(*) FROM channels", fetchone=True)[0]
-    
+    channels = [row[0] for row in db_query("SELECT channel_id FROM channels", fetchall=True) or []]
+
+    total_users = len(users)
+    subscribed = 0
+    not_subscribed = 0
+
+    # If there are no mandatory channels, treat all users as subscribed
+    if not channels:
+        subscribed = total_users
+    else:
+        for u_id in users:
+            try:
+                missing = False
+                for ch in channels:
+                    try:
+                        member = await bot.get_chat_member(chat_id=ch, user_id=u_id)
+                        if member.status not in ['member', 'administrator', 'creator']:
+                            jr = db_query(
+                                "SELECT 1 FROM join_requests WHERE user_id = ? AND channel_id = ?",
+                                (u_id, str(ch)),
+                                fetchone=True
+                            )
+                            if not jr:
+                                missing = True
+                                break
+                    except Exception:
+                        # On error querying membership, treat as not subscribed for safety
+                        missing = True
+                        break
+                if missing:
+                    not_subscribed += 1
+                else:
+                    subscribed += 1
+            except Exception:
+                not_subscribed += 1
+
     text = (
         "📊 Bot Statistikasi:\n\n"
-        f"👥 Foydalanuvchilar: {u_count}\n"
+        f"👥 Foydalanuvchilar (jami): {total_users}\n"
+        f"✅ A'zo bo'lganlar: {subscribed}\n"
+        f"❌ A'zo bo'lmaganlar: {not_subscribed}\n"
         f"👑 Adminlar: {a_count}\n"
-        f"📢 Majburiy kanallar: {c_count}"
+        f"📢 Majburiy kanallar: {len(channels)}"
     )
     await callback.message.answer(text)
     await callback.answer()
 
 @dp.callback_query(F.data == "adm_channels")
 async def adm_channels_cb(callback: CallbackQuery):
+    if not _is_private(callback):
+        return
     channels = db_query("SELECT channel_id, COALESCE(request_required,0) FROM channels", fetchall=True)
     builder = InlineKeyboardBuilder()
     for ch, req in channels:
@@ -368,8 +433,27 @@ async def adm_channels_cb(callback: CallbackQuery):
         reply_markup=builder.as_markup()
     )
 
+
+@dp.callback_query(F.data.startswith("set_link|"))
+async def set_link_cb(callback: CallbackQuery, state: FSMContext):
+    if not _is_private(callback):
+        return
+    ch_id = callback.data.split("|", 1)[1]
+    # fetch existing request_required flag to preserve it when updating
+    row = db_query("SELECT COALESCE(request_required,0) FROM channels WHERE channel_id = ?", (ch_id,), fetchone=True)
+    req_flag = int(row[0]) if row else 1
+    await state.update_data(channel_id=ch_id, request_required=req_flag)
+    await callback.message.answer(
+        "Kanal uchun join link yuboring (masalan: https://t.me/+ilUQlM-PNQQxZDli).\n"
+        "Agar linkni o'chirmoqchi bo'lsangiz, 'clear' deb yuboring."
+    )
+    await state.set_state(AdminStates.waiting_for_invite_link)
+    await callback.answer()
+
 @dp.callback_query(F.data == "toggle_mandatory")
 async def toggle_mandatory_cb(callback: CallbackQuery):
+    if not _is_private(callback):
+        return
     current = db_query("SELECT value FROM settings WHERE key = 'mandatory_enabled'", fetchone=True)[0]
     new_val = '0' if current == '1' else '1'
     db_query("UPDATE settings SET value = ? WHERE key = 'mandatory_enabled'", (new_val,))
@@ -377,6 +461,8 @@ async def toggle_mandatory_cb(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("add_ch|"))
 async def add_ch_cb(callback: CallbackQuery, state: FSMContext):
+    if not _is_private(callback):
+        return
     req_flag = callback.data.split("|")[1]
     await state.update_data(request_required=int(req_flag))
     await callback.message.answer(
@@ -388,12 +474,16 @@ async def add_ch_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("del_ch|"))
 async def del_ch_cb(callback: CallbackQuery):
+    if not _is_private(callback):
+        return
     ch_id = callback.data.split("|")[1]
     db_query("DELETE FROM channels WHERE channel_id = ?", (ch_id,))
     await adm_channels_cb(callback)
 
 @dp.callback_query(F.data == "adm_admins")
 async def adm_admins_cb(callback: CallbackQuery):
+    if not _is_private(callback):
+        return
     if callback.from_user.id not in SUPERADMIN_IDS:
         await callback.answer("Faqat Superadmin uchun!", show_alert=True)
         return
@@ -409,24 +499,32 @@ async def adm_admins_cb(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "add_adm")
 async def add_adm_cb(callback: CallbackQuery, state: FSMContext):
+    if not _is_private(callback):
+        return
     await callback.message.answer("Yangi admin username'ini yuboring (masalan: @username):")
     await state.set_state(AdminStates.waiting_for_new_admin)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("del_adm|"))
 async def del_adm_cb(callback: CallbackQuery):
+    if not _is_private(callback):
+        return
     a_id = callback.data.split("|")[1]
     db_query("DELETE FROM admins WHERE user_id = ?", (a_id,))
     await adm_admins_cb(callback)
 
 @dp.callback_query(F.data == "adm_broadcast")
 async def adm_broadcast_cb(callback: CallbackQuery, state: FSMContext):
+    if not _is_private(callback):
+        return
     await callback.message.answer("Reklama xabarini yuboring (Forward, Rasm, Video, Text hammasi o'tadi):")
     await state.set_state(AdminStates.waiting_for_broadcast)
     await callback.answer()
 
 @dp.callback_query(F.data == "adm_settings")
 async def adm_settings_cb(callback: CallbackQuery):
+    if not _is_private(callback):
+        return
     current = db_query("SELECT value FROM settings WHERE key = 'movie_channel'", fetchone=True)[0]
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="Kino kanalini o'zgartirish", callback_data="set_movie_ch"))
@@ -438,12 +536,16 @@ async def adm_settings_cb(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "set_movie_ch")
 async def set_movie_ch_cb(callback: CallbackQuery, state: FSMContext):
+    if not _is_private(callback):
+        return
     await callback.message.answer("Kino kanali ID yoki username'ini yuboring:")
     await state.set_state(AdminStates.waiting_for_movie_channel)
     await callback.answer()
 
 @dp.callback_query(F.data == "adm_back")
 async def adm_back_cb(callback: CallbackQuery):
+    if not _is_private(callback):
+        return
     await admin_cmd(callback.message)
     await callback.message.delete()
 
@@ -451,6 +553,8 @@ async def adm_back_cb(callback: CallbackQuery):
 
 @dp.message(AdminStates.waiting_for_channel)
 async def proc_add_ch(message: types.Message, state: FSMContext):
+    if not _is_private(message):
+        return
     data = await state.get_data()
     req_flag = int(data.get("request_required", 0))
 
@@ -477,48 +581,19 @@ async def proc_add_ch(message: types.Message, state: FSMContext):
 
     await state.update_data(channel_id=channel_id)
 
-    if req_flag == 1:
-        await message.answer(
-            "Zayavka kanali uchun join link yuboring (masalan: https://t.me/+ilUQlM-PNQQxZDli)."
-        )
-        await state.set_state(AdminStates.waiting_for_invite_link)
-        return
-
     db_query(
-        "INSERT OR IGNORE INTO channels (channel_id, request_required, invite_link) VALUES (?, ?, ?)",
-        (channel_id, req_flag, None)
+        "INSERT OR IGNORE INTO channels (channel_id, request_required) VALUES (?, ?)",
+        (channel_id, req_flag)
     )
     await message.answer(f"{channel_id} qo'shildi. Tur: {'zayavka' if req_flag else 'oddiy'}.")
     await state.clear()
 
-@dp.message(AdminStates.waiting_for_invite_link)
-async def proc_add_invite_link(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    channel_id = data.get("channel_id")
-    req_flag = int(data.get("request_required", 1))
 
-    invite_link = (message.text or "").strip()
-    if not invite_link:
-        await message.answer("Join link yuboring (https://t.me/+...).")
-        return
-    # Basic validation for zayavka links
-    if not (
-        invite_link.startswith("https://t.me/+")
-        or invite_link.startswith("https://t.me/joinchat/")
-        or "join_request=1" in invite_link
-    ):
-        await message.answer("Zayavka uchun t.me/+ yoki joinchat link yuboring.")
-        return
-
-    db_query(
-        "INSERT OR REPLACE INTO channels (channel_id, request_required, invite_link) VALUES (?, ?, ?)",
-        (channel_id, req_flag, invite_link)
-    )
-    await message.answer(f"{channel_id} qo'shildi. Join link saqlandi.")
-    await state.clear()
 
 @dp.message(AdminStates.waiting_for_new_admin)
 async def proc_add_adm(message: types.Message, state: FSMContext):
+    if not _is_private(message):
+        return
     text = message.text.strip()
     user_id = None
 
@@ -542,24 +617,30 @@ async def proc_add_adm(message: types.Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_movie_channel)
 async def proc_set_movie_ch(message: types.Message, state: FSMContext):
+    if not _is_private(message):
+        return
     db_query("UPDATE settings SET value = ? WHERE key = 'movie_channel'", (message.text,))
     await message.answer(f"Kino kanali {message.text} ga o'zgartirildi.")
     await state.clear()
 
 @dp.message(AdminStates.waiting_for_broadcast)
 async def proc_broadcast(message: types.Message, state: FSMContext):
-    users = [row[0] for row in db_query("SELECT user_id FROM users", fetchall=True)]
+    if not _is_private(message):
+        return
+    users = [row[0] for row in db_query("SELECT user_id FROM users", fetchall=True) or []]
+    total = len(users)
     count = 0
-    msg = await message.answer(f"Yuborilmoqda: 0/{len(users)}")
+    msg = await message.answer(f"Yuborilmoqda: 0/{total}")
     for i, u_id in enumerate(users):
         try:
-            await message.copy_to(u_id)
+            # Use bot.copy_message explicitly (more reliable than message.copy_to across contexts)
+            await bot.copy_message(chat_id=u_id, from_chat_id=message.chat.id, message_id=message.message_id)
             count += 1
         except TelegramRetryAfter as exc:
             logger.warning("Flood wait %.2fs when sending to %s", exc.retry_after, u_id)
             await asyncio.sleep(exc.retry_after + 1)
             try:
-                await message.copy_to(u_id)
+                await bot.copy_message(chat_id=u_id, from_chat_id=message.chat.id, message_id=message.message_id)
                 count += 1
             except Exception as retry_exc:
                 logger.error("Second attempt failed for %s: %s", u_id, retry_exc)
@@ -567,10 +648,20 @@ async def proc_broadcast(message: types.Message, state: FSMContext):
             logger.info("User %s blocked the bot; skipping.", u_id)
         except Exception as exc:
             logger.error("Broadcast failed for %s: %s", u_id, exc)
-        if count % 20 == 0:
-            await msg.edit_text(f"Yuborilmoqda: {count}/{len(users)}")
+
+        # Update progress every 20 attempts
+        if (i + 1) % 20 == 0 or (i + 1) == total:
+            try:
+                await msg.edit_text(f"Yuborilmoqda: {count}/{total}")
+            except Exception:
+                pass
+
         await asyncio.sleep(0.05)
-    await msg.edit_text(f"Tugatildi. {count} ta foydalanuvchiga yuborildi.")
+
+    try:
+        await msg.edit_text(f"Tugatildi. {count} ta foydalanuvchiga yuborildi.")
+    except Exception:
+        pass
     await state.clear()
 
 async def main():
